@@ -10,7 +10,11 @@ def user_data_dir():
     if override:
         root = Path(override).expanduser().resolve()
     elif sys.platform == 'win32':
-        root = Path(os.environ.get('LOCALAPPDATA', str(Path.home()/'AppData'/'Local')))/'ScrollFerry'
+        local_appdata = os.environ.get('LOCALAPPDATA')
+        if local_appdata:
+            root = Path(local_appdata)/'ScrollFerry'
+        else:
+            root = Path.home()/'AppData'/'Local'/'ScrollFerry'
     elif sys.platform == 'darwin':
         root = Path.home()/'Library'/'Application Support'/'ScrollFerry'
     else:
