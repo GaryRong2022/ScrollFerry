@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+output/
+tmp/
+*.pyc
+
+.browser-profile/
+build/
+dist/
+.DS_Store

@@ -1,0 +1,48 @@
+name: Build Windows installer
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      SCROLLFERRY_DATA_DIR: ${{ runner.temp }}\ScrollFerry-test-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: |
+          python -m pip install -r requirements.txt -r requirements-upload.txt "pyinstaller>=6.11,<7" "reportlab>=4,<5"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $innoCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $innoCompiler)) { choco install innosetup --yes --no-progress }
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build executable and installer
+        shell: pwsh
+        run: ./packaging/build.ps1
+      - name: Install into a path with spaces and test packaged app
+        shell: pwsh
+        run: |
+          $installFolder = Join-Path $env:RUNNER_TEMP 'ScrollFerry Installed Test'
+          $installer = Get-ChildItem dist/installer/ScrollFerry-Setup-*-x64.exe | Select-Object -First 1
+          $process = Start-Process $installer.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$installFolder`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Installer failed' }
+          $receipt = Join-Path $env:RUNNER_TEMP 'scrollferry-smoke.json'
+          $process = Start-Process (Join-Path $installFolder 'ScrollFerry.exe') -ArgumentList "--smoke-test `"$receipt`"" -PassThru
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Packaged app test timed out' }
+          if ($process.ExitCode -ne 0 -or -not (Test-Path $receipt)) { throw 'Packaged app test failed' }
+          $result = Get-Content $receipt | ConvertFrom-Json
+          if (-not $result.ok) { throw 'Invalid test receipt' }
+          Get-Content $receipt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScrollFerry-Windows-Installer-1.0.2
+          path: dist/installer/ScrollFerry-Setup-*-x64.exe
+          if-no-files-found: error
+          retention-days: 14
