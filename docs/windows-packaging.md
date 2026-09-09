@@ -1,6 +1,6 @@
 # Windows 安装程序构建
 
-GitHub Actions 使用云端 Windows 运行 PyInstaller 和 Inno Setup；Mac 上准备代码即可，无需本地 Windows。当前仓库提供构建配置，尚未在 GitHub 实际运行构建。
+GitHub Actions 使用云端 Windows 运行 PyInstaller 和 Inno Setup；Mac 上准备代码即可，无需本地 Windows。仓库已提供构建配置，安装包是否可用以对应 Actions 运行成功并生成附件为准。
 
 1. 在 GitHub 创建代码仓库，将项目源码及 `.github/workflows/windows-installer.yml` 推送到默认分支。不要上传试卷、output、tmp、浏览器登录目录或虚拟环境。
 2. 打开仓库 Actions → Build Windows installer → Run workflow。
