@@ -1,11 +1,11 @@
-#define AppVersion "1.0.2"
+﻿#define AppVersion "2.1.3"
 [Setup]
 AppId={{A64A051F-A89D-41CA-A72D-57CC73F8735F}
-AppName=ScrollFerry 舷渡
+AppName=舷渡 ScrollFerry
 AppVersion={#AppVersion}
-AppPublisher=ScrollFerry
+AppPublisher=舷渡 ScrollFerry
 DefaultDirName={localappdata}\Programs\ScrollFerry
-DefaultGroupName=ScrollFerry
+DefaultGroupName=舷渡 ScrollFerry
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -30,8 +30,8 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "..\dist\ScrollFerry\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\ScrollFerry"; Filename: "{app}\ScrollFerry.exe"
-Name: "{autodesktop}\ScrollFerry"; Filename: "{app}\ScrollFerry.exe"; Tasks: desktopicon
+Name: "{group}\舷渡 ScrollFerry"; Filename: "{app}\ScrollFerry.exe"
+Name: "{autodesktop}\舷渡 ScrollFerry"; Filename: "{app}\ScrollFerry.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ScrollFerry.exe"; Description: "Launch ScrollFerry"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\ScrollFerry.exe"; Description: "启动 舷渡 ScrollFerry"; Flags: nowait postinstall skipifsilent

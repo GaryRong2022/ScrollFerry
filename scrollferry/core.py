@@ -1,6 +1,7 @@
 """PDF coordinates and masks remain editable; originals are never modified."""
 import json
 import re
+import math
 from pathlib import Path
 
 import pdfplumber
@@ -32,7 +33,7 @@ EXPLANATION = re.compile(r"^\s*(?:\d{1,4}\s*[.．、]\s*)?(?:【\s*(?:答案)?�
 def split_option_lines(lines, width):
     result = []
     for line in lines:
-        matches = list(re.finditer(r'(?<![A-Za-z])([A-H])[.．、)）]\s*', line['text']))
+        matches = list(re.finditer(r'(?<![A-Za-z])([A-H])\s*[.．、)）]\s*', line['text']))
         if len(matches) < 2 or matches[0].start() > 2:
             result.append(line)
             continue
@@ -57,25 +58,82 @@ def read_pages(source, progress=None):
         for index, page in enumerate(doc.pages):
             if progress:
                 progress('读取 PDF 页面', index, len(doc.pages))
-            lines = page.extract_text_lines(return_chars=True, y_tolerance=5)
+            # Large diagonal watermark glyphs can be merged into ordinary lines.
+            # Ignore them for recognition only; the original PDF still renders intact.
+            text_page = page.filter(lambda obj: obj.get('object_type') != 'char' or obj.get('height', 0) < 65)
+            lines = text_page.extract_text_lines(return_chars=True, y_tolerance=5)
             pages.append({'width': page.width, 'height': page.height, 'lines': lines,
+                          'images': [{'x0':i['x0'], 'x1':i['x1'], 'top':i['top'], 'bottom':i['bottom']} for i in page.images],
                           'rects': [{'x0':r['x0'],'x1':r['x1'],'top':r['top'],'bottom':r['bottom'],
                                      'color':r.get('non_stroking_color')} for r in page.rects]})
+    if progress:
+        progress('PDF 页面读取完成', len(pages), len(pages))
     return pages
 
 
-def prefix_box(line, count):
+def prefix_box(line, count, legacy=False):
     prefix_length = len(re.sub(r'\s', '', line['text'][:count]))
-    chars = [c for c in sorted(line.get('chars', []), key=lambda c: c['x0']) if c['text'].strip()][:prefix_length]
+    all_chars = [c for c in sorted(line.get('chars', []), key=lambda c: c['x0']) if c['text'].strip()]
+    chars = all_chars[:prefix_length]
     if not chars:
         return None
-    return [min(c['x0'] for c in chars) - 0.3, min(c['top'] for c in chars) - 3,
-            max(c['x1'] for c in chars), max(c['bottom'] for c in chars) + 3]
+    right = max(c['x1'] for c in chars)
+    if not legacy and len(all_chars) > prefix_length:
+        right = min(right, all_chars[prefix_length]['x0'] - .5)
+    padding = 3 if legacy else .5
+    return [min(c['x0'] for c in chars) - 0.3, min(c['top'] for c in chars) - padding,
+            right, max(c['bottom'] for c in chars) + padding]
 
 
-def detect(source, pages=None, progress=None):
+def repair_prefix_masks(project, pages):
+    """Upgrade only recognizable automatic masks, leaving user erasures alone."""
+    replacements = {}
+    for pn, page in enumerate(pages):
+        for line in split_option_lines(page['lines'], page['width']):
+            match = QUESTION.match(line['text']) or OPTION.match(line['text'])
+            if match:
+                old = prefix_box(line, match.end(), legacy=True)
+                new = prefix_box(line, match.end())
+                if old and new:
+                    replacements[(pn, tuple(round(v,3) for v in old))] = new
+    for q in project['questions']:
+        for asset in q['assets']:
+            for region in asset['regions']:
+                for index, mask in enumerate(region['masks']):
+                    new = replacements.get((region['page'], tuple(round(v,3) for v in mask)))
+                    if new is not None and new != mask:
+                        region['masks'][index] = list(new)
+                        # Restore the narrow strip potentially removed by a
+                        # previously tightened frame after an excessive mask.
+                        if region['box'][0] <= mask[2]+4:
+                            region['box'][0] = min(region['box'][0], new[2])
+                        q['reviewed'] = False
+
+
+def paint_mask(draw, mask, scale, origin=(0,0)):
+    # Pillow rectangles include their right/bottom pixel. Keep those pixels
+    # strictly inside the PDF mask so rounding cannot erase the next glyph.
+    box = (math.ceil(mask[0]*scale)-origin[0], math.ceil(mask[1]*scale)-origin[1],
+           math.floor(mask[2]*scale)-1-origin[0], math.floor(mask[3]*scale)-1-origin[1])
+    if box[2] >= box[0] and box[3] >= box[1]:
+        draw.rectangle(box, fill='white')
+
+
+def detect(source, pages=None, progress=None, answer_source=None, answer_pages=None):
+    project = _detect(source, pages, progress, answer_source, answer_pages)
+    # Synthetic layout-only callers do not have a PDF to render.
+    if Path(source).is_file():
+        tighten_regions(project, progress)
+    return project
+
+
+def _detect(source, pages=None, progress=None, answer_source=None, answer_pages=None):
     """Automatically locate supported layouts; retain unresolved items in the report."""
     pages = read_pages(source, progress) if pages is None else pages
+    if answer_source is not None:
+        from .separate import detect_separate
+        answer_pages = read_pages(answer_source, progress) if answer_pages is None else answer_pages
+        return detect_separate(source, answer_source, pages, answer_pages, progress)
     from .layout import segment
     structured = segment(str(Path(source).resolve()), pages, progress)
     if structured and structured['questions']:
@@ -174,6 +232,12 @@ def detect(source, pages=None, progress=None):
 
 
 def render_page(source, page, scale=1.5):
+    if isinstance(source, dict):
+        count = source.get('question_page_count', 0)
+        if source.get('answer_source') and page >= count:
+            source, page = source['answer_source'], page-count
+        else:
+            source = source['source']
     doc = pdfium.PdfDocument(source)
     try:
         p = doc[page]
@@ -189,17 +253,85 @@ def render_page(source, page, scale=1.5):
         doc.close()
 
 
-def crop_region(source, region, scale=2):
+def content_bounds(image):
+    gray = ImageOps.grayscale(image)
+    bounds = gray.point(lambda value: 255 if value < 220 else 0).getbbox()
+    if bounds is None:
+        bounds = gray.point(lambda value: 255 if value < 250 else 0).getbbox()
+    return bounds
+
+
+def tighten_regions(project, progress=None):
+    """Use the same ink bounds for every editable screenshot and its export."""
+    from functools import lru_cache
+    @lru_cache(maxsize=2)
+    def page_image(page):
+        return render_page(project, page, 2)
+    targets = [(q, r) for q in project['questions'] for a in q['assets']
+               for r in a['regions']]
+    try:
+        for index, (question, region) in enumerate(targets):
+            if progress:
+                progress('收紧题干、选项与答案解析截图框', index, len(targets))
+            original = region['box']
+            box = tuple(round(v*2) for v in original)
+            if box[2]<=box[0] or box[3]<=box[1]:
+                continue
+            image = page_image(region['page']).crop(box)
+            draw = ImageDraw.Draw(image)
+            for mask in region['masks']:
+                paint_mask(draw, mask, 2, box[:2])
+            bounds = content_bounds(image)
+            if bounds:
+                l,t,r,b = bounds
+                updated = [max(original[0],(box[0]+l-4)/2), max(original[1],(box[1]+t-4)/2),
+                           min(original[2],(box[0]+r+4)/2), min(original[3],(box[1]+b+4)/2)]
+                if updated != original:
+                    region['box'] = updated
+                    question['reviewed'] = False
+        if progress:
+            progress('截图框收紧完成', len(targets), len(targets))
+    finally:
+        page_image.cache_clear()
+
+
+def trim_content(image, border=4):
+    """Measure printed ink, ignoring the very pale paper watermark for bounds.
+
+    Keep original pixels (including any watermark within the crop), with a
+    small guard for antialiasing. Blank regions retain their original size.
+    """
+    bounds = content_bounds(image)
+    if bounds:
+        l, t, r, b = bounds
+        image = image.crop((max(0,l-1), max(0,t-1), min(image.width,r+1), min(image.height,b+1)))
+    return ImageOps.expand(image, border=border, fill='white')
+
+
+def crop_region(source, region, scale=2, tight=False):
     image = render_page(source, region['page'], scale)
     draw = ImageDraw.Draw(image)
     for mask in region['masks']:
-        draw.rectangle(tuple(round(v * scale) for v in mask), fill='white')
+        paint_mask(draw, mask, scale)
     box = tuple(round(v * scale) for v in region['box'])
     if box[2] <= box[0] or box[3] <= box[1]:
         raise ValueError('截图范围无效，请重新框选')
     # Keep a visible buffer around the final image; masking never expands into
     # adjoining content merely to make the screenshot look tighter.
-    return ImageOps.expand(image.crop(box), border=8, fill='white')
+    cropped = image.crop(box)
+    return trim_content(cropped) if tight else ImageOps.expand(cropped, border=8, fill='white')
+
+
+def render_asset(project, asset, scale=2):
+    images = [crop_region(project, r, scale, tight=True) for r in asset['regions']]
+    if not images:
+        raise ValueError('截图缺少区域')
+    canvas = Image.new('RGB', (max(i.width for i in images), sum(i.height for i in images)), 'white')
+    y = 0
+    for image in images:
+        canvas.paste(image, (0,y))
+        y += image.height
+    return canvas
 
 
 def export(project, destination, progress=None):
@@ -239,14 +371,7 @@ def export(project, destination, progress=None):
         for index, asset in enumerate(question['assets']):
             if progress:
                 progress('截图去标号并保存', completed, total)
-            images = [crop_region(project['source'], r) for r in asset['regions']]
-            if not images:
-                continue
-            canvas = Image.new('RGB', (max(i.width for i in images), sum(i.height for i in images)), 'white')
-            y = 0
-            for image in images:
-                canvas.paste(image, (0, y))
-                y += image.height
+            canvas = render_asset(project, asset)
             name = f"{prefix}_{question['id']}_{index+1:02d}_{asset['kind']}.png"
             canvas.save(destination / name)
             row['images'].append({'kind': asset['kind'], 'filename': name})

@@ -5,7 +5,7 @@ GitHub Actions 使用云端 Windows 运行 PyInstaller 和 Inno Setup；Mac 上�
 1. 在 GitHub 创建代码仓库，将项目源码及 `.github/workflows/windows-installer.yml` 推送到默认分支。不要上传试卷、output、tmp、浏览器登录目录或虚拟环境。
 2. 打开仓库 Actions → Build Windows installer → Run workflow。
 3. 工作流运行本地测试、生成软件文件夹、制作安装 EXE，再执行静默安装与打包程序启动检查。
-4. 成功后，在本次运行的 Artifacts 下载 `ScrollFerry-Windows-Installer-1.0.2`，解压得到 `ScrollFerry-Setup-1.0.2-x64.exe`。
+4. 成功后，在本次运行的 Artifacts 下载 `ScrollFerry-Windows-Installer-2.1.3`，解压得到 `ScrollFerry-Setup-2.1.3-x64.exe`。
 
 安装向导支持选择目录、开始菜单和可选桌面快捷方式、卸载入口。默认安装到当前用户的 Programs 目录，不要求管理员权限。目标为 Windows 10/11 x64；当前安装向导使用 Inno Setup 自带英文界面，应用界面保持中文。本流程只产生下载附件，不自动发布 GitHub Release。
 

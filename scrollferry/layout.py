@@ -25,7 +25,7 @@ def segment(source, pages, progress=None):
             box = prefix_box(line, match.end())
             kind = 'section' if section else 'question' if q else 'option' if option else tag[1]
             events.append({'page':pn, 'line':line, 'kind':kind, 'match':match, 'mask':box,
-                           'top':box[1]+3, 'bottom':box[3]-3})
+                           'top':box[1]+.5, 'bottom':box[3]-.5})
     sections = [e for e in events if e['kind']=='section']
     if not sections or not any(e['kind']=='答案' for e in events):
         return None

@@ -6,10 +6,47 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen.canvas import Canvas
 
-from scrollferry.core import crop_region, detect, export
+from scrollferry.core import crop_region, detect, export, trim_content
 
 
 class PipelineTest(unittest.TestCase):
+    def test_answer_and_explanation_share_tight_bounds_and_export(self):
+        from copy import deepcopy
+        from unittest.mock import patch
+        from PIL import Image, ImageDraw
+        from scrollferry.core import tighten_regions, render_asset
+        page = Image.new('RGB', (200, 160), 'white')
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((40, 50, 100, 90), fill='black')
+        draw.point((110, 40), fill='black')  # Isolated formula mark must survive.
+        region = {'page':0, 'box':[0,0,100,80], 'masks':[]}
+        assets = [{'kind':kind, 'regions':[deepcopy(region)]}
+                  for kind in ('stem', 'option_A', 'answer', 'explanation')]
+        project = {'questions':[{'reviewed':True, 'assets':assets}]}
+        with patch('scrollferry.core.render_page', return_value=page):
+            tighten_regions(project)
+            self.assertEqual(assets[0]['regions'][0]['box'], [18,18,57.5,47.5])
+            for asset in assets:
+                self.assertEqual(asset['regions'][0]['box'], assets[0]['regions'][0]['box'])
+                self.assertEqual(render_asset(project,asset).tobytes(), render_asset(project,assets[0]).tobytes())
+            self.assertFalse(project['questions'][0]['reviewed'])
+
+    def test_tight_crop_preserves_small_formula_marks(self):
+        from PIL import Image, ImageDraw
+        image = Image.new('RGB', (300,200), 'white')
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((200,100,280,180), fill=(240,240,240))
+        draw.rectangle((80,60,100,90), fill='black')
+        draw.point((110,50), fill='black')
+        result = trim_content(image)
+        self.assertEqual(result.size, (41,51))
+        self.assertEqual(result.getpixel((35,5)), (0,0,0))
+        self.assertEqual(result.getpixel((0,0)), (255,255,255))
+
+    def test_blank_crop_does_not_disappear(self):
+        from PIL import Image
+        self.assertEqual(trim_content(Image.new('RGB',(30,20),'white')).size, (38,28))
+
     def test_five_option_mixed_paper(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'five.pdf'
@@ -88,6 +125,11 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual([q['answer'] for q in project['questions']], ['A', 'A'])
             self.assertEqual([a['kind'] for a in project['questions'][0]['assets']], ['stem', 'option_A', 'option_B', 'explanation'])
             first = project['questions'][0]['assets'][0]['regions'][0]
+            # Tight frames may exclude the erased number entirely. Expand only
+            # this test crop to keep the original mask visible for inspection.
+            x0, y0, x1, y1 = first['masks'][0]
+            first = dict(first, box=[min(first['box'][0],x0-1), min(first['box'][1],y0-1),
+                                     max(first['box'][2],x1+1), max(first['box'][3],y1+1)])
             image = crop_region(str(path), first)
             x0, y0, x1, y1 = first['masks'][0]
             bx, by, _, _ = first['box']

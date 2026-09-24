@@ -1,6 +1,6 @@
 # ScrollFerry · 舷渡 技术说明
 
-适用版本：v1.0.2。本文面向开发、打包及维护人员；日常操作见 [使用说明](user-guide.md)。
+适用版本：v2.1.3。本文面向开发、打包及维护人员；日常操作见 [使用说明](user-guide.md)。
 
 ## 1. 整体架构
 
@@ -17,6 +17,7 @@ PDF → 文字与版面分析 → 题目工程 → 人工校对 → 图片及 ma
 | `scrollferry/app.py` | Tk 界面、校对编辑、撤销重做、进度窗口、上传入口 |
 | `scrollferry/core.py` | PDF 读取、基础识别、截图渲染、工程与批次导出 |
 | `scrollferry/layout.py` | 结构化版面识别、题目与答案区域对应、跨页拆分 |
+| `scrollferry/separate.py` | 分卷按题号匹配、共用材料及写作题识别、公式图片边界 |
 | `scrollferry/upload.py` | 上传校验、图片命名、队列、状态保存与恢复 |
 | `scrollferry/xiaoe.py` | 小鹅通页面定位、素材操作、题目填写及保存 |
 | `scrollferry/browsers.py` | Chrome / Edge 优先级和启动回退 |
@@ -38,6 +39,10 @@ pypdfium2 渲染原页面，Pillow 完成白色遮盖、裁切、留边和拼接
 ## 3. 工程和导出数据
 
 工程保存源 PDF 路径、题目、答案、校对状态、识别提示及各截图区域。源 PDF 不嵌入工程，移动源文件会影响后续读取。题型包括单选、多选、填空、解答及未确定类型；截图类型包括题干、选项、答案原图和解析。
+
+分卷工程为 version 4，额外保存 `answer_source` 和 `question_page_count`。区域页码在两卷拼接后的虚拟页序中连续编号；`render_page(project, page)` 将后半段映射到解析 PDF，编辑、预览与导出使用同一映射。旧单卷工程仍然有效。共用题干在各题中保存独立区域副本；写作题使用 `solution` 类型及 `subtype` 标记，不虚构文字答案。解析内部的数字条目不作为新题号，通过 section 与 original_number 配对，允许不同题型重新编号；同一分区的重复题号仍不自动配对。
+
+396 分卷样本回归可设置 `SCROLLFERRY_SEPARATE_QUESTIONS` 与 `SCROLLFERRY_SEPARATE_ANSWERS`，再执行完整单元测试。样本 PDF 和生成图片不提交到仓库。
 
 导出批次包含以下文件：
 
@@ -145,3 +150,11 @@ GitHub Actions 的 `Build Windows installer` 由手动触发，在 Windows runne
 - 修改清单或队列格式时，明确旧版本迁移方式，尤其不能清空已保存记录后自动重试。
 - Windows 路径代码应仅在环境变量缺失时计算主目录回退值，避免测试环境没有主目录变量时提前触发异常。
 - Actions 的运行时弃用提醒与实际失败应分开判断；定位失败步骤中最早的具体异常，再检查安装包是否实际生成。
+
+## 2.1.3 实现补充
+
+- `separate.py` 负责分卷分区匹配和页眉页脚边界；`theme.py` 统一界面样式。
+- `progress.py`、`progress_button.py`、`ferry_animation.py` 提供任务状态、完成操作和可停止的场景动画。
+- 连续 PDF 视图只渲染可见页，同页选题复用图片并更新独立选框层；Tk 9 的 `TouchpadScroll` 单独解码双轴位移。
+- 编辑器 `EditorNotReady` 仅在保存前重开表单，最多重试两次。分组创建未确认记录 `group_status=unconfirmed`，恢复时只查找、不重复创建。
+- 导出完成的上传入口先执行导出成功回调，再打开上传面板，使用本次批次。

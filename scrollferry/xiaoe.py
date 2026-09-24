@@ -12,12 +12,17 @@ MATERIAL_CENTER = 'https://admin.xiaoe-tech.com/t/material-center/materialCenter
 TYPES = {'single_choice': 0, 'multiple_choice': 1, 'fill_blank': 4, 'solution': 2}
 
 
+class MenuNotReady(RuntimeError):
+    """A transient collapsed menu, before any material is inserted."""
+
+
 class XiaoeBrowser:
     def __init__(self, profile=None):
         self.profile = Path(profile) if profile else None
         self.runtime = self.context = None
 
     def open(self, progress):
+        self.progress = progress
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -26,7 +31,7 @@ class XiaoeBrowser:
         failures = []
         for channel in browser_channels():
             name = 'Chrome' if channel == 'chrome' else 'Edge'
-            progress(f'正在启动 {name} 上传窗口', 0, 1)
+            progress(f'正在启动 {name} 上传窗口', 0, 0)
             profile = self.profile or user_data_dir()/'browser-profiles'/channel
             try:
                 self.context = self.runtime.chromium.launch_persistent_context(
@@ -45,43 +50,62 @@ class XiaoeBrowser:
         self.page.goto(MATERIAL_CENTER)
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
-            progress(f'请在新打开的 {self.browser_name} 登录小鹅通，登录后自动继续', 0, 1)
+            progress(f'请在新打开的 {self.browser_name} 登录小鹅通，登录后自动继续', 0, 0)
             if self.page.get_by_placeholder('请输入图片名称', exact=True).is_visible():
                 break
             self.page.wait_for_timeout(500)
         else:
             raise ValueError('等待登录超时，请重新开始上传')
 
+    def find_material_group(self, group_name):
+        """Search again after reload; search results need not expose treeitem roles."""
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        for attempt in range(3):
+            if attempt:
+                self.progress(f'正在重新查找素材分组（{attempt}/2）',0,0)
+                self.page.goto(MATERIAL_CENTER)
+            search = self.page.get_by_role('textbox', name='请输入分组名称', exact=True).first
+            try:
+                search.wait_for(timeout=15000)
+                search.fill(group_name)
+                search.press('Enter')
+                # Search results may be flat rows instead of ARIA tree items.
+                label = self.page.get_by_text(group_name, exact=True).filter(visible=True)
+                label.first.wait_for(timeout=7000)
+                if label.count()!=1:
+                    raise ValueError('素材分组名称不唯一，已停止')
+                return label
+            except BrowserTimeout:
+                continue
+        return None
+
     def open_material_center(self, group_name, group_status='pending'):
-        from playwright.sync_api import expect
         self.center_mode = True
         self.material_group = group_name
         if self.page.url != MATERIAL_CENTER:
             self.page.goto(MATERIAL_CENTER)
         self.material = self.page
         self.page.get_by_placeholder('请输入图片名称', exact=True).wait_for()
-        search = self.page.get_by_role('textbox', name='请输入分组名称', exact=True)
-        search.fill(group_name)
-        search.press('Enter')
-        target = self.page.get_by_role('treeitem').filter(has=self.page.get_by_text(group_name, exact=True))
-        try:
-            target.wait_for(timeout=5000)
-        except Exception:
-            if group_status == 'ready':
-                raise ValueError('原素材分组未找到，请检查分组是否被移动或删除；不会重新上传到默认分组')
-            self.page.get_by_text('返回', exact=True).click()
+        target = self.find_material_group(group_name)
+        if target is None:
+            if group_status in ('ready','unconfirmed'):
+                raise ValueError('重试后仍未找到原素材分组，请检查分组是否被移动或删除；进度已保留。')
+            back = self.page.get_by_text('返回', exact=True)
+            if back.count()==1 and back.is_visible():
+                back.click()
             self.page.get_by_role('img', name='addgroup', exact=True).click()
             self.page.get_by_role('textbox', name='请输入分组名称', exact=True).last.fill(group_name)
-            self.page.get_by_role('button', name='确定', exact=True).click()
-            search.fill(group_name)
-            search.press('Enter')
-            target.wait_for()
-        if target.count() != 1:
-            raise ValueError('素材分组名称不唯一，已停止')
+            from .upload import MaterialGroupUnconfirmed
+            try:
+                self.page.get_by_role('button', name='确定', exact=True).click()
+                target = self.find_material_group(group_name)
+                if target is None:
+                    raise MaterialGroupUnconfirmed('素材分组创建结果未确认，请重试查找；不会重复创建。')
+            except Exception as exc:
+                raise MaterialGroupUnconfirmed('素材分组创建结果未确认，请重试查找；不会重复创建。') from exc
         target.click()
         self.page.get_by_placeholder('请输入图片名称', exact=True).fill('')
-        # Upload destination is checked again in the upload dialog before files are selected.
-        expect(target).to_be_visible()
+        # Upload destination is independently verified before selecting any files.
 
     def dismiss_tip(self):
         tip = self.page.get_by_text('题库支持多级知识点，快来体验吧！', exact=False)
@@ -164,12 +188,12 @@ class XiaoeBrowser:
         body.wait_for()
         return body
 
-    def on_screen_text(self, text):
+    def on_screen_text(self, text, timeout=2):
         # UEditor retains offscreen toolbar clones as visible DOM nodes.
         # Only the expanded menu inside the viewport is an actionable target.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            matches = self.page.get_by_text(text, exact=True)
+            matches = self.page.get_by_text(text, exact=True).filter(visible=True)
             candidates = []
             viewport = self.page.viewport_size
             for index in range(matches.count()):
@@ -182,26 +206,68 @@ class XiaoeBrowser:
             if len(candidates) > 1:
                 raise ValueError(f'页面中有多个可见“{text}”，已停止以避免误点')
             self.page.wait_for_timeout(100)
-        raise ValueError(f'菜单中未找到可见“{text}”')
+        raise MenuNotReady(f'菜单中未找到可见“{text}”')
+
+    def material_dialog(self):
+        # Closed pickers stay in the DOM. Only reuse the currently open picker.
+        title = self.page.get_by_text('选择图片', exact=True).filter(visible=True)
+        if not title.count():
+            return None
+        dialogs = self.page.get_by_role('dialog').filter(has=title).filter(visible=True)
+        if not dialogs.count():
+            dialogs = title.locator('xpath=ancestor::*[.//button[contains(.,"上传图片")] and .//input][1]')
+        if dialogs.count() != 1:
+            raise ValueError('素材选择窗口无法唯一定位，已停止以避免选错素材')
+        return dialogs
+
+    def click_material_menu(self):
+        self.on_screen_text('图片').hover(timeout=2000)
+        target = self.on_screen_text('从素材库选择')
+        # Native pointer movement toward a cascading menu can cross another
+        # menu item and collapse the submenu. Activate the verified DOM node
+        # without moving the pointer; no upload/insert/save is performed here.
+        clicked = target.evaluate('''el => {
+            const r = el.getBoundingClientRect();
+            if (!r.width || !r.height || r.x < 0 || r.y < 0 ||
+                r.x >= innerWidth || r.y >= innerHeight ||
+                getComputedStyle(el).visibility !== 'visible' ||
+                el.textContent.trim() !== '从素材库选择') return false;
+            el.click();
+            return true;
+        }''', timeout=2000)
+        if not clicked:
+            raise MenuNotReady('素材库子菜单在点击前收起')
 
     def open_materials(self, index=0):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
         self.center_mode = False
-        self.editor_body(index).click()
-        self.page.get_by_text('插入', exact=True).nth(index).click()
-        self.on_screen_text('图片').hover()
-        self.on_screen_text('从素材库选择').click()
-        self.page.get_by_text('选择图片', exact=True).wait_for()
-        # Prefer semantic dialog; fallback to the closest ancestor owning upload/search.
-        dialogs = self.page.get_by_role('dialog').filter(has_text='选择图片')
-        if dialogs.count() == 1:
-            self.material = dialogs
-        else:
-            self.material = self.page.get_by_text('选择图片', exact=True).locator(
-                'xpath=ancestor::*[.//button[contains(.,"上传图片")] and .//input][1]')
-        if self.material.count() != 1:
-            raise ValueError('素材选择窗口结构已变化，未执行上传')
-        self.material.get_by_role('button', name='上传图片', exact=True).wait_for()
-        self.material.locator('.ss-loading-mask:visible').first.wait_for(state='hidden')
+        for attempt in range(3):
+            getattr(self, 'progress', lambda *args: None)(
+                f'打开第 {index+1} 个编辑区的素材库' + (f' · 正在重试 {attempt}/2' if attempt else ''), 0, 0)
+            try:
+                material = self.material_dialog()
+                if material is None:
+                    self.editor_body(index).click(timeout=3000)
+                    # Bind the toolbar to this editor, rather than an index in
+                    # all retained toolbar/menu clones on the page.
+                    frame = self.page.locator('iframe').filter(visible=True).nth(index)
+                    toolbar_owner = frame.locator('xpath=ancestor::*[.//*[normalize-space(text())="插入"]][1]')
+                    toolbar_owner.get_by_text('插入', exact=True).filter(visible=True).click(timeout=3000)
+                    self.click_material_menu()
+                    self.page.get_by_text('选择图片', exact=True).filter(visible=True).wait_for(timeout=4000)
+                    material = self.material_dialog()
+                    if material is None:
+                        raise MenuNotReady('素材选择窗口尚未打开')
+                self.material = material
+                self.material.get_by_role('button', name='上传图片', exact=True).wait_for(timeout=4000)
+                self.material.locator('.ss-loading-mask:visible').first.wait_for(state='hidden', timeout=4000)
+                return
+            except (MenuNotReady, PlaywrightTimeout) as exc:
+                if attempt == 2:
+                    raise RuntimeError(f'打开素材库重试 3 次仍未完成，当前题目尚未保存。\n{exc}') from exc
+                # If the picker opened late, reuse it on the next pass instead
+                # of toggling the toolbar again. Nothing has been inserted yet.
+                self.page.wait_for_timeout(300 * (attempt+1))
 
     def find_material(self, name):
         search = self.material.get_by_placeholder(
@@ -222,21 +288,29 @@ class XiaoeBrowser:
 
     def upload_files(self, files):
         from .upload import UploadNotStarted
+        stage = '检查素材中心'
         try:
             if not self.center_mode:
                 raise ValueError('请先在素材中心完成集中上传')
-            self.page.get_by_text('上传图片', exact=True).click()
+            stage = '打开上传窗口'
+            # Closed upload dialogs remain in the DOM after a batch. Their
+            # hidden titles must not compete with the visible upload entry.
+            self.page.get_by_text('上传图片', exact=True).filter(visible=True).click()
             uploader = self.page.get_by_role('dialog', name='上传图片', exact=True)
             uploader.wait_for()
             from playwright.sync_api import expect
+            stage = '核对上传目标分组'
             expect(uploader.get_by_role('textbox', name='请选择', exact=True)).to_have_value(self.material_group)
+            stage = '等待确认上传按钮'
             confirm = uploader.get_by_role('button', name=re.compile(r'^确认上传(?:\(\d+\))?$'))
             confirm.wait_for()
+            stage = '打开文件选择器'
             with self.page.expect_file_chooser() as choice:
                 uploader.get_by_text('选择图片', exact=True).click()
         except Exception as exc:
-            raise UploadNotStarted('上传尚未开始：未打开文件选择器') from exc
+            raise UploadNotStarted(f'本轮文件尚未提交：{stage}失败。\n具体原因：{exc}') from exc
         choice.value.set_files([str(file) for file in files])
+        getattr(self, 'progress', lambda *args: None)(f'已选择 {len(files)} 张图片 · 提交上传并等待后台回执', 0, 0)
         confirm.click()
         from playwright.sync_api import expect
         expect(uploader).to_contain_text(
@@ -264,6 +338,7 @@ class XiaoeBrowser:
         body = self.editor_body(index)
         before = body.locator('img').count()
         self.open_materials(index)
+        getattr(self, 'progress', lambda *args: None)(f'在素材库精确搜索图片：{name}', 0, 0)
         # Initial dialog loading may overwrite the first search response.
         deadline = time.monotonic() + 30
         while not self.find_material(name):
@@ -292,8 +367,7 @@ class XiaoeBrowser:
         if kind in ('single_choice', 'multiple_choice'):
             self.adjust_options(len(options))
         expected = len(options)+2 if kind in ('single_choice', 'multiple_choice') else (3 if kind == 'solution' else 2)
-        if self.page.locator('iframe').filter(visible=True).count() != expected:
-            raise ValueError('编辑框数量与截图数量不一致，已停止')
+        self.wait_editors(expected)
         self.insert(0, assets['stem'])
         if kind in ('single_choice', 'multiple_choice'):
             for i, key in enumerate(options, 1):
@@ -329,7 +403,19 @@ class XiaoeBrowser:
             self.page.get_by_role('img', name='close', exact=True).filter(visible=True).last.click()
             current -= 1
             expect(choices).to_have_count(current)
-        expect(self.page.locator('iframe').filter(visible=True)).to_have_count(count + 2)
+        self.wait_editors(count + 2)
+
+    def wait_editors(self, count):
+        from playwright.sync_api import expect, TimeoutError as BrowserTimeout
+        from .upload import EditorNotReady
+        editors = self.page.locator('iframe').filter(visible=True)
+        try:
+            expect(editors).to_have_count(count, timeout=20000)
+            for index in range(count):
+                editors.nth(index).content_frame.locator('body').wait_for(timeout=15000)
+        except (AssertionError, BrowserTimeout) as exc:
+            raise EditorNotReady(f'编辑器尚未加载完整：需要 {count} 个，当前显示 {editors.count()} 个。\n'
+                                 '已保存的题目会保留，可点击“重试”继续。') from exc
 
     def save_question(self):
         self.page.get_by_role('button', name='保存', exact=True).click()

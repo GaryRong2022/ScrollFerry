@@ -12,6 +12,14 @@ class UploadNotStarted(RuntimeError):
     pass
 
 
+class EditorNotReady(RuntimeError):
+    """The unsaved form did not finish loading; safe to rebuild it."""
+
+
+class MaterialGroupUnconfirmed(RuntimeError):
+    """Submitted group creation must not be repeated blindly."""
+
+
 def write_state(path, value):
     path = Path(path)
     temporary = path.with_suffix('.tmp')
@@ -189,15 +197,20 @@ def execute(batch, category, adapter, progress=lambda *args: None, limit=None, m
     images = state['images']
     try:
         adapter.open(progress)
-        progress('在素材中心建立试卷分组', 0, len(images))
-        adapter.open_material_center(state['material_group'], state['group_status'])
+        progress('阶段 1 · 查找或建立本批次素材分组', 0, 0)
+        try:
+            adapter.open_material_center(state['material_group'], state['group_status'])
+        except MaterialGroupUnconfirmed:
+            state['group_status'] = 'unconfirmed'
+            save()
+            raise
         state['group_status'] = 'ready'
         save()
         total = len(images) + len(pending)
         done = 0
         missing = []
-        for item in images:
-            progress(f'检查素材 {item["upload_name"]}', done, total)
+        for checked, item in enumerate(images):
+            progress(f'阶段 2 · 检查素材 {checked+1}/{len(images)}：{item["upload_name"]}', checked, len(images))
             if item['status'] != 'uploaded':
                 if adapter.find_material(item['upload_name']):
                     item['status'] = 'uploaded'
@@ -206,40 +219,58 @@ def execute(batch, category, adapter, progress=lambda *args: None, limit=None, m
                     raise ValueError(f'图片 {item["upload_name"]} 上次提交结果未确认，请先在素材库核对')
                 else:
                     missing.append(item)
+        confirmed = sum(i['status']=='uploaded' for i in images)
+        progress(f'素材检查完成 · 已确认 {confirmed} 张，待上传 {len(missing)} 张', len(images), len(images))
         for offset in range(0, len(missing), 100):
             group = missing[offset:offset+100]
-            progress(f'批量上传 {len(group)} 张截图', done, total)
+            batch_label = f'第 {offset//100+1}/{(len(missing)+99)//100} 批（{len(group)} 张）'
+            progress(f'阶段 3 · 上传{batch_label} · 已确认 {confirmed}/{len(images)} 张', 0, 0)
             for item in group:
                 item['status'] = 'submitting'
             save()
             try:
                 adapter.upload_files([runtime/'upload-assets'/item['upload_name'] for item in group])
-            except UploadNotStarted:
+            except UploadNotStarted as exc:
                 for item in group:
                     item['status'] = 'pending'
                 save()
-                raise
+                uploaded = sum(item['status'] == 'uploaded' for item in images)
+                raise UploadNotStarted(
+                    f'已确认上传 {uploaded}/{len(images)} 张图片，进度已保留。\n'
+                    f'{exc}\n请使用原批次继续，已确认的图片会跳过。') from exc
             for item in group:
-                adapter.wait_material(item['upload_name'], progress)
+                progress(f'阶段 3 · 核对上传结果 · {item["upload_name"]}', confirmed, len(images))
+                adapter.wait_material(item['upload_name'],
+                                      lambda stage, current, count: progress(
+                                          f'{stage} · 已确认 {confirmed}/{len(images)} 张', confirmed, len(images)))
                 item['status'] = 'uploaded'
+                confirmed += 1
                 done += 1
                 save()
+                progress(f'上传已确认 · {confirmed}/{len(images)} 张', confirmed, len(images))
         done = len(images)
         if materials_only:
             state['status'] = 'materials_uploaded'
             state.pop('last_error', None)
             save()
             return state
-        progress('创建并核对同名题库分类', done, total)
+        progress('阶段 4 · 创建并核对同名题库分类', 0, 0)
         adapter.ensure_question_category(category, state.get('category_status', 'pending'))
         state['category_status'] = 'ready'
         save()
-        for question in pending:
+        for question_index, question in enumerate(pending):
             row = rows[question['id']]
-            progress(f'填入第 {question["id"]} 题', done, total)
+            progress(f'阶段 5 · 填写 {question["id"]} · 本次第 {question_index+1}/{len(pending)} 题', question_index, len(pending))
             assets = {i['kind']: i['upload_name'] for i in images if i['question_id'] == question['id']}
-            adapter.fill_question(row, assets, category)
-            progress(f'保存第 {question["id"]} 题', done, total)
+            for attempt in range(3):
+                try:
+                    adapter.fill_question(row, assets, category)
+                    break
+                except EditorNotReady:
+                    if attempt == 2:
+                        raise
+                    progress(f'{question["id"]} 编辑器加载不完整，正在重新打开（重试 {attempt+1}/2）', 0, 0)
+            progress(f'阶段 5 · 保存 {question["id"]}，等待后台确认（请勿重复提交）', 0, 0)
             question['status'] = 'submitting'
             save()
             adapter.save_question()
@@ -247,7 +278,8 @@ def execute(batch, category, adapter, progress=lambda *args: None, limit=None, m
             question['reason'] = ''
             done += 1
             save()
-            progress(f'已保存第 {question["id"]} 题', done, total)
+            saved_count = sum(q['status']=='saved' for q in state['questions'])
+            progress(f'已保存 {question["id"]} · 本批次累计 {saved_count}/{len(state["questions"])} 题', question_index+1, len(pending))
         state['status'] = 'completed' if all(q['status'] == 'saved' for q in state['questions']) else 'partial'
         state.pop('last_error', None)
         save()

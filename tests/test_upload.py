@@ -43,6 +43,49 @@ class FakeBrowser:
 
 
 class UploadTest(unittest.TestCase):
+    def test_uncertain_group_creation_is_remembered_for_retry(self):
+        from scrollferry.upload import MaterialGroupUnconfirmed
+        class GroupBrowser(FakeBrowser):
+            statuses=[]
+            def open_material_center(self,group,status):
+                self.statuses.append(status)
+                raise MaterialGroupUnconfirmed('group result unknown')
+        browser=GroupBrowser()
+        for _ in range(2):
+            with self.assertRaises(MaterialGroupUnconfirmed):
+                execute(self.batch,'',browser)
+        self.assertEqual(browser.statuses,['pending','unconfirmed'])
+        self.assertEqual(browser.uploads,0)
+
+    def test_incomplete_editor_reopens_before_save_and_resumes(self):
+        from scrollferry.upload import EditorNotReady
+        class LoadingBrowser(FakeBrowser):
+            attempts = 0
+            def fill_question(self, row, assets, category):
+                self.attempts += 1
+                if self.attempts <= 2:
+                    raise EditorNotReady('only 3 editors')
+                super().fill_question(row,assets,category)
+        browser = LoadingBrowser()
+        execute(self.batch,'',browser)
+        self.assertEqual(browser.attempts,3)
+        self.assertEqual(browser.saves,1)
+        self.assertEqual(browser.uploads,3)
+
+    def test_editor_retry_limit_keeps_question_pending(self):
+        from scrollferry.upload import EditorNotReady
+        class LoadingBrowser(FakeBrowser):
+            attempts = 0
+            def fill_question(self,*args):
+                self.attempts += 1
+                raise EditorNotReady('still loading')
+        browser = LoadingBrowser()
+        with self.assertRaises(EditorNotReady):
+            execute(self.batch,'',browser)
+        self.assertEqual(browser.attempts,3)
+        self.assertEqual(browser.saves,0)
+        self.assertEqual(prepare_upload(self.batch)['questions'][0]['status'],'pending')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -107,6 +150,41 @@ class UploadTest(unittest.TestCase):
         browser = FakeBrowser()
         execute(self.batch, '', browser)
         self.assertEqual(browser.saves, 1)
+
+    def test_three_batches_resume_after_second_batch_never_started(self):
+        rows = []
+        for index in range(69):
+            row = dict(self.row, id=f'Q{index+1:04d}', images=[])
+            for item in self.row['images']:
+                filename = f'{index}_{item["filename"]}'
+                (self.batch/filename).write_bytes(b'png-data')
+                row['images'].append(dict(item, filename=filename))
+            rows.append(row)
+        (self.batch/'manifest.json').write_text(json.dumps(rows))
+
+        class FailSecondBatch(FakeBrowser):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+                self.fail = True
+            def upload_files(self, files):
+                self.batches.append(len(files))
+                if len(self.batches) == 2 and self.fail:
+                    raise UploadNotStarted('dialog did not open')
+                super().upload_files(files)
+
+        browser = FailSecondBatch()
+        with self.assertRaisesRegex(UploadNotStarted, '100/207'):
+            execute(self.batch, '', browser, materials_only=True)
+        state = prepare_upload(self.batch)
+        self.assertEqual(sum(i['status']=='uploaded' for i in state['images']), 100)
+        self.assertFalse(any(i['status']=='submitting' for i in state['images']))
+        browser.fail = False
+        result = execute(self.batch, '', browser, materials_only=True)
+        self.assertEqual(browser.batches, [100,100,100,7])
+        self.assertEqual(browser.uploads, 207)
+        self.assertTrue(all(i['status']=='uploaded' for i in result['images']))
+        self.assertEqual(browser.saves, 0)
 
     def test_trial_still_uploads_whole_paper_including_blocked_answers(self):
         second = dict(self.row, id='Q0002', type='fill_blank', answer='', answer_status='needs_formula_recognition')
